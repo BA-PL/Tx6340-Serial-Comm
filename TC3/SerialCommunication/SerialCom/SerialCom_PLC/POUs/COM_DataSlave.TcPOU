@@ -1,0 +1,226 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="COM_DataSlave" Id="{dba6f380-1a5e-4315-90f2-8fcdf5ce96c5}" SpecialFunc="None">
+    <Declaration><![CDATA[(*							Beckhoff Automation Poland												*)
+(*								COM_DataSlave v 1.1												*)
+(* 					v1.1 - przykład przygotowania i odczytu danych 									*)
+(*									23.01.2015														*)
+(*		Program szablonowy do komunkacji RS typu pytanie-odpowiedz, strona Slavea				*)
+(*		Zastosowanie w klasycznym cyklu - czekamy na zapytanie, analizujemy zapytanie,			*)
+(*						wysyłamy odpowiedz, powrot do oczekiwania. 								*)
+(*				W przypadku wystapienia bledu jest on zliczony i zapamietany. 						*)
+(*				Po okreslonym czasie nastepoje powrot do kroku poczatkowego 						*)
+(*__________________________________________________________________________________*)
+PROGRAM COM_DataSlave
+VAR
+(**************** Zmienne wymagane do komunikacji ****************)
+	fbSerialLineControl		: SerialLineControl;
+	COMInData AT %I*		: KL6inData22B;		(* Do modyfikacji *)
+	COMOutData AT %Q* 		: KL6outData22B;	(* Do modyfikacji *)
+	RxBuffer				: ComBuffer; 		(* Bufor z portem COM*)
+	TxBuffer				: ComBuffer; 		(* Bufor z portem COM*)
+	fbSend					: SendData;			(* Blok funkcyjny odbierający dane *)
+	fbReceive				: ReceiveData;		(* Blok funkcyjny odbierający dane *)
+(* Zmienne pomocnicze *)
+	iSate					: INT;
+	TempData				: ARRAY [1..5] OF BYTE;
+	wErrorCounter			: WORD;
+	eErrorID					: ComError_t;
+	sFrameError				: STRING := 'Czekam na dane';
+	tonReset				: TON;
+	InDataEmpty				: ARRAY [1..5] OF BYTE; (* Wyczyszczenie danych *)
+	OutDataEmpty			: ARRAY [1..10] OF BYTE; (* Wyczyszczenie danych *)
+(* Dane odczytane i wyslane *)
+	InData					: ARRAY [1..5] OF BYTE; (* Dane odczytane - przechowywane do kolejnego odpytania *)
+	OutData					: ARRAY [1..10] OF BYTE; (* Dane wyslane - przechowywane do kolejnego odpytania *)
+END_VAR
+(*	Q FRAME Bytes:
+1, 2 	- Start (F00F)
+3  		- ADDR (1-10)
+4		- Question (1-10)
+5		- CRC (Arythmetic, bytes 3-4)			*)
+
+(*	A FRAME Bytes:
+1, 2 	- Start (F00F)
+3  		- ADDR (1-10)
+4		- Question (1-10)
+5 		- DATA_TYPE (0 - 4xBOOL, 1 - 2xINT, 2 - 1xDWORD, 3 - 1xREAL)
+6,7,8,9	- DATA
+10		- CRC (Arythmetic, bytes 3-9)			*)]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[fbSerialLineControl(
+	Mode:=SERIALLINEMODE_KL6_22B_STANDARD,			(* Do modyfikacji *)
+	pComIn:=ADR( COMInData),
+	pComOut:=ADR(COMOutData) ,
+	SizeComIn:=SIZEOF(COMInData) ,
+	TxBuffer:=TxBuffer ,
+	RxBuffer:=RxBuffer);
+
+fbReceive(
+	pReceiveData:= ADR(TempData),
+	SizeReceiveData:= SIZEOF(TempData),
+	Timeout:= T#30ms,
+	RXbuffer:= RxBuffer);
+
+(* Slave side *)
+CASE iSate OF
+
+0:	(* Wait for query *)
+	IF fbReceive.DataReceived THEN
+		OutData := OutDataEmpty;
+		InData := TempData;
+		iSate := iSate + 10;
+	END_IF
+	(* Zliczanie bledow *)
+	IF fbReceive.Error <> 0 THEN
+		eErrorID := fbReceive.Error;
+		wErrorCounter := wErrorCounter + 1;
+		iSate := 10000;
+	END_IF
+
+10:	(* Data analyse *)			(* Do modyfikacji *)
+	(* Zakladamy adres 1 *)
+	IF InData[3] = 1 THEN
+		(* Obliczam CRC *)
+		IF InData[5] = (InData[3] + InData[4]) THEN
+		(* Dane prawidlowe, sprawdze czy znam komende i przygotowuje odpowiedz *)
+			sFrameError := 'Dane prawidlowe wysylam odpowiedz';
+			A_AnalizaDanych();
+			iSate := iSate + 10;
+		ELSE
+			(* Dane sa uszkodzone, wiec wracam do nasluchu *)
+			sFrameError := 'Blad CRC';
+			iSate := 0;
+		END_IF
+	ELSE
+		(* To nie moje dane, wiec wracam do nasluchu *)
+		sFrameError := 'To nie moj adres';
+		iSate := 0;
+	END_IF
+20:	(* Send answer *)
+	fbSend(
+		pSendData:= ADR(OutData),
+		Length:= SIZEOF(OutData),
+		TXbuffer:= TxBuffer);
+	IF NOT fbSend.Busy AND fbSend.Error = 0 THEN
+		iSate := 0;
+	END_IF
+	IF fbSend.Error <> 0 THEN
+		eErrorID := fbSend.Error;
+		wErrorCounter := wErrorCounter + 1;
+		iSate := 10000;
+	END_IF
+
+10000: (* Error *)
+	tonReset(IN:= TRUE, PT:= T#5s);			(* Do modyfikacji *)
+	IF tonReset.Q THEN
+		tonReset(IN:= FALSE);
+		eErrorID := 0;
+		TempData := InDataEmpty;
+		OutData := OutDataEmpty;
+		InData := InDataEmpty;
+		iSate := 0;
+	END_IF
+END_CASE
+]]></ST>
+    </Implementation>
+    <Action Name="A_AnalizaDanych" Id="{4a1b022e-a8eb-4912-8ce1-8c4ff656cbe2}">
+      <Implementation>
+        <ST><![CDATA[OutData[1] := 16#F0; (* Start *)
+OutData[2] := 16#0F; (* Start *)
+OutData[3] := 1; (* Adres *)
+(* W zaleznosci od tego jaka komende dostalismy szykujemy dane *)
+CASE InData[4] OF
+1: (* Zalacz wszystkie wyjscia cyfrowe *)
+	OutData[5] := 0; (* DATA_TYPE *)
+	OutData[6] := 1; (* DATA *)
+	OutData[7] := 1; (* DATA *)
+	OutData[8] := 1; (* DATA *)
+	OutData[9] := 1; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+
+2: (* Wylacz wszystkie wyjscia cyfrowe *)
+	OutData[5] := 0; (* DATA_TYPE *)
+	OutData[6] := 0; (* DATA *)
+	OutData[7] := 0; (* DATA *)
+	OutData[8] := 0; (* DATA *)
+	OutData[9] := 0; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+
+3: (* Zalacz parzyste wyjscie cyfrowe *)
+	OutData[5] := 0; (* DATA_TYPE *)
+	OutData[6] := 1; (* DATA *)
+	OutData[7] := 0; (* DATA *)
+	OutData[8] := 1; (* DATA *)
+	OutData[9] := 0; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+
+4: (* Podaj max wartosc na 1 wyjscie analogowe (32767 dec = 16#7FFF) i pol zakresu na 2 wyjscie analogowe (16383 dec = 16#3FFF) *)
+	OutData[5] := 1; (* DATA_TYPE *)
+	OutData[6] := 16#7F; (* DATA *)
+	OutData[7] := 16#FF; (* DATA *)
+	OutData[8] := 16#3F; (* DATA *)
+	OutData[9] := 16#FF; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+
+5: (* Podaj max wartosc na oba wyjscia analogowe (32767 dec = 16#7FFF) *)
+	OutData[5] := 1; (* DATA_TYPE *)
+	OutData[6] := 16#7F; (* DATA *)
+	OutData[7] := 16#FF; (* DATA *)
+	OutData[8] := 16#7F; (* DATA *)
+	OutData[9] := 16#FF; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+
+6: (* Podaj 0 na oba wyjscia analogowe *)
+	OutData[5] := 1; (* DATA_TYPE *)
+	OutData[6] := 0; (* DATA *)
+	OutData[7] := 0; (* DATA *)
+	OutData[8] := 0; (* DATA *)
+	OutData[9] := 0; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+
+7: (* Wpisz cos dziwnego w DWORDa *)
+	OutData[5] := 2; (* DATA_TYPE *)
+	OutData[6] := 16#0A; (* DATA *)
+	OutData[7] := 16#0B; (* DATA *)
+	OutData[8] := 16#0C; (* DATA *)
+	OutData[9] := 16#0D; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+
+8: (* Wpisz max w DWORDa *)
+	OutData[5] := 2; (* DATA_TYPE *)
+	OutData[6] := 16#FF; (* DATA *)
+	OutData[7] := 16#FF; (* DATA *)
+	OutData[8] := 16#FF; (* DATA *)
+	OutData[9] := 16#FF; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+
+9: (* Wpisz 100 do zmiennej REAL 16#42C80000 *)
+	OutData[5] := 3; (* DATA_TYPE *)
+	OutData[6] := 16#42; (* DATA *)
+	OutData[7] := 16#C8; (* DATA *)
+	OutData[8] := 16#00; (* DATA *)
+	OutData[9] := 16#00; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+
+10: (* Wpisz 0.01 do zmiennej REAL16#3C23D70A*)
+	OutData[5] := 3; (* DATA_TYPE *)
+	OutData[6] := 16#3C; (* DATA *)
+	OutData[7] := 16#23; (* DATA *)
+	OutData[8] := 16#D7; (* DATA *)
+	OutData[9] := 16#0A; (* DATA *)
+	OutData[10] := OutData[3] + OutData[4] + OutData[5] + OutData[6] + OutData[7] + OutData[8] + OutData[9]; (* CRC *)
+ELSE
+	(* Nieznana komenda *)
+	sFrameError := 'Nieznana komenda';
+	OutData[5] := 0; (* DATA *)
+	OutData[6] := 0; (* DATA *)
+	OutData[7] := 0; (* DATA *)
+	OutData[8] := 0; (* DATA *)
+	OutData[9] := 0; (* DATA_TYPE *)
+	OutData[10] := 0;(* CRC *)
+END_CASE]]></ST>
+      </Implementation>
+    </Action>
+  </POU>
+</TcPlcObject>

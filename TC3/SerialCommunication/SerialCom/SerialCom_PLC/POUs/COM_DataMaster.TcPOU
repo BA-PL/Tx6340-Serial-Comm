@@ -1,0 +1,184 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="COM_DataMaster" Id="{8be62579-00cf-4ada-bcc8-f3b96eef2681}" SpecialFunc="None">
+    <Declaration><![CDATA[(*							Beckhoff Automation Poland												*)
+(*								COM_DataMaster v 1.1												*)
+(* 					v1.1 - przykład przygotowania i odczytu danych 									*)
+(*									23.01.2015														*)
+(*		Program szablonowy do komunkacji RS typu pytanie-odpowiedz, strona Mastera				*)
+(*		Zastosowanie w klasycznym cyklu - czekamy na rozkaz do zapytania, wysylamy zapytanie,	*)
+(*			oczekujemy na odpowiedz, analizujemy odpowiedz, powrot do oczekiwania. 				*)
+(*				W przypadku wystapienia bledu jest on zliczony i zapamietany. 						*)
+(*				Po okreslonym czasie nastepoje powrot do kroku poczatkowego 						*)
+(*__________________________________________________________________________________*)
+PROGRAM COM_DataMaster
+VAR
+(**************** Zmienne wymagane do komunikacji ****************)
+	fbSerialLineControl		: SerialLineControl;
+	COMInData AT %I*		: KL6inData22B;		(* Do modyfikacji *)
+	COMOutData AT %Q* 		: KL6outData22B;	(* Do modyfikacji *)
+	RxBuffer				: ComBuffer; 		(* Bufor z portem COM*)
+	TxBuffer				: ComBuffer; 		(* Bufor z portem COM*)
+	fbSend					: SendData;			(* Blok funkcyjny odbierający dane *)
+	fbReceive				: ReceiveData;		(* Blok funkcyjny odbierający dane *)
+(* Zmienne pomocnicze *)
+	fbTimer					: TON;
+	bRead					: BOOL;
+	iSate					: INT;
+	TempData				: ARRAY [1..10] OF BYTE;
+	wErrorCounter			: WORD;
+	eErrorID				: ComError_t;
+	tonReset				: TON;
+	sFrameError				: STRING;
+	InDataEmpty				: ARRAY [1..10] OF BYTE; (* Wyczyszczenie danych *)
+	OutDataEmpty			: ARRAY [1..5] OF BYTE; (* Wyczyszczenie danych *)
+(* Dane odczytane i wyslane *)
+	InData					: ARRAY [1..10] OF BYTE; (* Dane odczytane - przechowywane do kolejnego odpytania *)
+	OutData					: ARRAY [1..5] OF BYTE; (* Dane wyslane - przechowywane do kolejnego odpytania *)
+(* Zmienne do ktorych wpisujemy dane *)
+	bOut1					: BOOL;
+	bOut2					: BOOL;
+	bOut3					: BOOL;
+	bOut4					: BOOL;
+	iOut1 					: INT;
+	iOut2 					: INT;
+	dwOut 					: DWORD;
+	rOut 					: REAL;
+END_VAR
+
+(*	Q FRAME Bytes:
+1, 2 	- Start (F00F)
+3  		- ADDR (1-10)
+4		- Question (1-10)
+5		- CRC (Arythmetic, bytes 3-4)			*)
+
+(*	A FRAME Bytes:
+1, 2 	- Start (F00F)
+3  		- ADDR (1-10)
+4		- Question (1-10)
+5 		- DATA_TYPE (0 - 4xBOOL, 1 - 2xINT, 2 - 1xDWORD, 3 - 1xREAL)
+6,7,8,9	- DATA
+10		- CRC (Arythmetic, bytes 3-9)			*)
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[fbSerialLineControl(
+	Mode:=SERIALLINEMODE_KL6_22B_STANDARD,			(* Do modyfikacji *)
+	pComIn:=ADR( COMInData),
+	pComOut:=ADR(COMOutData) ,
+	SizeComIn:=SIZEOF(COMInData) ,
+	TxBuffer:=TxBuffer ,
+	RxBuffer:=RxBuffer);
+
+fbReceive(
+	pReceiveData:= ADR(TempData),
+	SizeReceiveData:= SIZEOF(TempData),
+	Timeout:= T#30ms,
+	RXbuffer:= RxBuffer);
+
+fbTimer(IN := NOT fbTimer.Q, PT:= T#1s, Q => bRead);
+
+(* Master side *)
+CASE iSate OF
+
+0:	(* Wait *)
+	IF bRead THEN
+		InData := InDataEmpty;
+			(* Do modyfikacji *)
+			OutData[1] := 16#F0; (* Start *)
+			OutData[2] := 16#0F; (* Start *)
+			OutData[3] := 1; (* Adres *)
+			OutData[4] := 1; (* Adres *)
+			OutData[5] := 1; (* Adres *)
+		iSate := iSate + 10;
+	END_IF
+
+10:	(* Send query *)
+	fbSend(
+		pSendData:= ADR(OutData),
+		Length:= SIZEOF(OutData),
+		TXbuffer:= TxBuffer);
+	IF NOT fbSend.Busy AND fbSend.Error = 0 THEN
+		iSate := iSate + 10;
+	END_IF
+	IF fbSend.Error <> 0 THEN
+		eErrorID := fbSend.Error;
+		wErrorCounter := wErrorCounter + 1;
+		iSate := 10000;
+	END_IF
+
+20:	(* Wait for answer *)
+	IF fbReceive.DataReceived THEN
+		InData := TempData;
+		iSate := iSate + 10;
+	END_IF
+	(* Zliczanie bledow *)
+	IF fbReceive.Error <> 0 THEN
+		eErrorID := fbReceive.Error;
+		wErrorCounter := wErrorCounter + 1;
+		iSate := 10000;
+	END_IF
+
+30:	(* Data analyse *)
+	(* Zakladamy adres 1 *)
+	IF InData[3] = 1 THEN
+		(* Obliczam CRC *)
+		IF InData[10] = (InData[3] + InData[4] + InData[5] + InData[6] + InData[7] + InData[8] + InData[9]) THEN
+		(* Dane prawidlowe, sprawdze czy znam komende i przygotowuje odpowiedz *)
+			sFrameError := 'Dane prawidlowe - analizuje';
+			A_AnalizaDanych();
+			iSate := iSate + 10;
+		ELSE
+			(* Dane sa uszkodzone, wiec wracam do nasluchu *)
+			sFrameError := 'Blad CRC';
+			iSate := 0;
+		END_IF
+	ELSE
+		(* To nie moje dane, wiec wracam do nasluchu *)
+		sFrameError := 'To nie moj adres';
+		iSate := 0;
+	END_IF
+
+
+10000: (* Error *)
+	tonReset(IN:= TRUE, PT:= T#5s);			(* Do modyfikacji *)
+	IF tonReset.Q THEN
+		tonReset(IN:= FALSE);
+		eErrorID := 0;
+		TempData := InDataEmpty;
+		OutData := OutDataEmpty;
+		InData := InDataEmpty;
+		iSate := 0;
+	END_IF
+END_CASE]]></ST>
+    </Implementation>
+    <Action Name="A_AnalizaDanych" Id="{d5f6059d-36e5-40e2-b9a9-4cccdc4f5f98}">
+      <Implementation>
+        <ST><![CDATA[(* W zaleznosci od tego jaki typ danych podejmujemy odpowiednie dzialania *)
+CASE InData[5] OF
+0: (* 4xBOOL*)
+	bOut1 := InData[6].0;
+	bOut2 := InData[7].0;
+	bOut3 := InData[8].0;
+	bOut4 := InData[9].0;
+
+1: (* 2xINT *)
+	iOut1 := InData[6]*16#100 +InData[7];
+	iOut2 := InData[8]*16#100 +InData[9];
+
+2: (* 1xDWORD *)
+	dwOut := InData[6]*16#1000000+InData[7]*16#10000+InData[8]*16#100+InData[9];
+
+3: (* 1xREAL *)
+	MEMCPY(ADR(rOut)+3,ADR(InData[6]),1);
+	MEMCPY(ADR(rOut)+2,ADR(InData[7]),1);
+	MEMCPY(ADR(rOut)+1,ADR(InData[8]),1);
+	MEMCPY(ADR(rOut),ADR(InData[9]),1);
+
+ELSE
+	(* Nieznany typ *)
+	sFrameError := 'Nieznany typ';
+END_CASE]]></ST>
+      </Implementation>
+    </Action>
+  </POU>
+</TcPlcObject>
